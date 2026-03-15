@@ -20,7 +20,6 @@ TOP_K = 8
 N_GROUP = 8
 TOPK_GROUP = 4
 BLOCK = 128
-USE_TORCH_ROUTING = True
 GEMM1_INPUT_PRECISION = "tf32"
 GEMM2_INPUT_PRECISION = "tf32"
 GEMM1_BLOCK_M = 64
@@ -54,6 +53,10 @@ def routing_kernel(
     logits = tl.load(routing_logits_ptr + pid * stride_logits_t + offs, mask=offs < NUM_EXPERTS, other=0.0)
     bias = tl.load(routing_bias_ptr + offs, mask=offs < NUM_EXPERTS, other=0.0)
 
+    # Cast to fp32 — tl.exp requires fp32+, and matches PyTorch's .to(float32)
+    logits = tl.cast(logits, tl.float32)
+    bias = tl.cast(bias, tl.float32)
+
     s = 1.0 / (1.0 + tl.exp(-logits))
     s_with_bias = s + bias
 
@@ -66,7 +69,7 @@ def routing_kernel(
         mask = group_id == g
         vals = tl.where(mask, s_with_bias, -float("inf"))
         max1 = tl.max(vals, axis=0)
-        best_idx = tl.max(tl.where(vals == max1, offs, -1), axis=0)
+        best_idx = tl.min(tl.where(vals == max1, offs, NUM_EXPERTS), axis=0)
         vals2 = tl.where(offs == best_idx, -float("inf"), vals)
         max2 = tl.max(vals2, axis=0)
         score = max1 + max2
@@ -77,7 +80,7 @@ def routing_kernel(
     for _ in tl.static_range(0, TOPK_GROUP):
         masked = tl.where(group_keep, -float("inf"), group_scores)
         best_val = tl.max(masked, axis=0)
-        best_idx = tl.max(tl.where(masked == best_val, group_ids, -1), axis=0)
+        best_idx = tl.min(tl.where(masked == best_val, group_ids, N_GROUP), axis=0)
         group_keep = group_keep | (group_ids == best_idx)
 
     # Mask experts not in kept groups.
@@ -96,7 +99,7 @@ def routing_kernel(
     for k in tl.static_range(0, TOP_K):
         masked = tl.where(selected, -float("inf"), scores_pruned)
         best_val = tl.max(masked, axis=0)
-        best_idx = tl.max(tl.where(masked == best_val, offs, -1), axis=0)
+        best_idx = tl.min(tl.where(masked == best_val, offs, NUM_EXPERTS), axis=0)
         topk_idx = tl.where(tl.arange(0, TOP_K) == k, best_idx, topk_idx)
         selected = selected | (offs == best_idx)
 
@@ -374,54 +377,26 @@ def kernel(
     device = hidden_states.device
     seq_len = int(routing_logits.shape[0])
 
-    # Routing: compute topk indices and weights.
-    if USE_TORCH_ROUTING:
-        logits = routing_logits.to(torch.float32)
-        bias = routing_bias.to(torch.float32).view(1, NUM_EXPERTS)
-        s = torch.sigmoid(logits)
-        s_with_bias = s + bias
+    # Routing: compute topk indices and weights via single Triton kernel.
+    topk_idx = torch.empty((seq_len, TOP_K), device=device, dtype=torch.int32)
+    topk_weight = torch.empty((seq_len, TOP_K), device=device, dtype=torch.float32)
 
-        group_size = NUM_EXPERTS // N_GROUP
-        s_grouped = s_with_bias.view(seq_len, N_GROUP, group_size)
-        top2_vals, _ = torch.topk(s_grouped, k=2, dim=2, largest=True, sorted=False)
-        group_scores = top2_vals.sum(dim=2)
-        _, group_idx = torch.topk(group_scores, k=TOPK_GROUP, dim=1, largest=True, sorted=False)
-
-        group_mask = torch.zeros_like(group_scores)
-        group_mask.scatter_(1, group_idx, 1.0)
-        score_mask = group_mask.unsqueeze(2).expand(seq_len, N_GROUP, group_size).reshape(seq_len, NUM_EXPERTS)
-        scores_pruned = s_with_bias.masked_fill(score_mask == 0, torch.finfo(torch.float32).min)
-        _, topk_idx = torch.topk(scores_pruned, k=TOP_K, dim=1, largest=True, sorted=False)
-
-        m = torch.zeros_like(s)
-        m.scatter_(1, topk_idx, 1.0)
-        weights = s * m
-        weights = (weights / (weights.sum(dim=1, keepdim=True) + 1e-20)) * float(routed_scaling_factor)
-        topk_weight = torch.gather(weights, 1, topk_idx)
-
-        topk_idx = topk_idx.to(torch.int32)
-        topk_weight = topk_weight.to(torch.float32)
-    else:
-        topk_idx = torch.empty((seq_len, TOP_K), device=device, dtype=torch.int32)
-        topk_weight = torch.empty((seq_len, TOP_K), device=device, dtype=torch.float32)
-
-        routing_grid = (seq_len,)
-        routing_kernel[routing_grid](
-            routing_logits,
-            routing_bias,
-            topk_idx,
-            topk_weight,
-            routing_logits.stride(0),
-            topk_idx.stride(0),
-            seq_len,
-            float(routed_scaling_factor),
-            NUM_EXPERTS=NUM_EXPERTS,
-            TOP_K=TOP_K,
-            N_GROUP=N_GROUP,
-            TOPK_GROUP=TOPK_GROUP,
-            num_warps=8,
-            num_stages=2,
-        )
+    routing_kernel[(seq_len,)](
+        routing_logits,
+        routing_bias,
+        topk_idx,
+        topk_weight,
+        routing_logits.stride(0),
+        topk_idx.stride(0),
+        seq_len,
+        float(routed_scaling_factor),
+        NUM_EXPERTS=NUM_EXPERTS,
+        TOP_K=TOP_K,
+        N_GROUP=N_GROUP,
+        TOPK_GROUP=TOPK_GROUP,
+        num_warps=8,
+        num_stages=2,
+    )
 
     # Expert counts and compaction.
     expert_counts = torch.zeros((NUM_LOCAL_EXPERTS,), device=device, dtype=torch.int32)
