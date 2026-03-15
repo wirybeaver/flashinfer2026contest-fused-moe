@@ -32,8 +32,8 @@ USE_TORCH_ACCUMULATE = False
 USE_TORCH_GEMM1 = False
 USE_TORCH_GEMM2 = False
 USE_FP32_GEMM = False
-GEMM1_INPUT_PRECISION = "ieee"
-GEMM2_INPUT_PRECISION = "ieee"
+GEMM1_INPUT_PRECISION = "tf32"
+GEMM2_INPUT_PRECISION = "tf32"
 GEMM1_CORRECT_K_BLOCKS = 0
 GEMM2_CORRECT_K_BLOCKS = 0
 TORCH_MATMUL_PRECISION = "high"
@@ -832,6 +832,219 @@ def fused_gemm2_accumulate_kernel(
     tl.store(out_ptrs, out, mask=mask)
 
 
+@triton.jit
+def grouped_fp8_gemm1_kernel(
+    a_ptr,
+    w_ptr,
+    w_scale_ptr,
+    token_idx_ptr,
+    c_ptr,
+    expert_offsets_ptr,
+    m_tile_offsets_ptr,
+    N,
+    K,
+    stride_am,
+    stride_ak,
+    expert_stride_w,
+    stride_wm,
+    stride_wk,
+    stride_cm,
+    stride_cn,
+    expert_stride_scale,
+    stride_scale_n,
+    stride_scale_k,
+    total_tokens,
+    NUM_EXPERTS: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SCALE_BLOCK: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Binary search for expert_id from pid_m
+    lo = 0
+    hi = NUM_EXPERTS
+    for _ in tl.static_range(0, 8):  # log2(256) = 8, more than enough for 32
+        mid = (lo + hi) // 2
+        mid_val = tl.load(m_tile_offsets_ptr + mid)
+        lo = tl.where(mid_val <= pid_m, mid, lo)
+        hi = tl.where(mid_val <= pid_m, hi, mid)
+    expert_id = lo
+
+    expert_start = tl.load(expert_offsets_ptr + expert_id)
+    expert_end = tl.load(expert_offsets_ptr + expert_id + 1)
+    M = expert_end - expert_start
+    tile_start = tl.load(m_tile_offsets_ptr + expert_id)
+    local_pid_m = pid_m - tile_start
+
+    offs_m = local_pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    token_ids = tl.load(token_idx_ptr + expert_start + offs_m, mask=offs_m < M, other=0)
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+    w_base = w_ptr + expert_id * expert_stride_w
+    scale_base = w_scale_ptr + expert_id * expert_stride_scale
+
+    for k in range(0, K, BLOCK_K):
+        k_ids = k + offs_k
+        a_ptrs = a_ptr + token_ids[:, None] * stride_am + k_ids[None, :] * stride_ak
+        a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (k_ids[None, :] < K), other=0.0)
+        a = tl.cast(a, tl.float32)
+
+        w_ptrs = w_base + k_ids[:, None] * stride_wk + offs_n[None, :] * stride_wm
+        w = tl.load(w_ptrs, mask=(k_ids[:, None] < K) & (offs_n[None, :] < N), other=0.0)
+        w = tl.cast(w, tl.float32)
+
+        n_block = (pid_n * BLOCK_N) // SCALE_BLOCK
+        k_block = k // SCALE_BLOCK
+        scale = tl.load(scale_base + n_block * stride_scale_n + k_block * stride_scale_k)
+        w = w * scale
+
+        acc += tl.dot(a, w, input_precision=INPUT_PRECISION)
+
+    c_ptrs = c_ptr + (expert_start + offs_m[:, None]) * stride_cm + offs_n[None, :] * stride_cn
+    tl.store(c_ptrs, acc, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
+
+
+@triton.jit
+def grouped_swiglu_kernel(
+    g_ptr,
+    c_ptr,
+    expert_offsets_ptr,
+    m_tile_offsets_ptr,
+    stride_gm,
+    stride_gn,
+    stride_cm,
+    stride_cn,
+    NUM_EXPERTS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    INTERMEDIATE_SIZE: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Binary search for expert_id
+    lo = 0
+    hi = NUM_EXPERTS
+    for _ in tl.static_range(0, 8):
+        mid = (lo + hi) // 2
+        mid_val = tl.load(m_tile_offsets_ptr + mid)
+        lo = tl.where(mid_val <= pid_m, mid, lo)
+        hi = tl.where(mid_val <= pid_m, hi, mid)
+    expert_id = lo
+
+    expert_start = tl.load(expert_offsets_ptr + expert_id)
+    expert_end = tl.load(expert_offsets_ptr + expert_id + 1)
+    M = expert_end - expert_start
+    tile_start = tl.load(m_tile_offsets_ptr + expert_id)
+    local_pid_m = pid_m - tile_start
+
+    offs_m = local_pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+
+    global_m = expert_start + offs_m
+    x1_ptrs = g_ptr + global_m[:, None] * stride_gm + offs_n[None, :] * stride_gn
+    x2_ptrs = g_ptr + global_m[:, None] * stride_gm + (offs_n[None, :] + INTERMEDIATE_SIZE) * stride_gn
+
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < INTERMEDIATE_SIZE)
+    x1 = tl.load(x1_ptrs, mask=mask, other=0.0)
+    x2 = tl.load(x2_ptrs, mask=mask, other=0.0)
+    silu = x2 / (1.0 + tl.exp(-x2))
+    c = silu * x1
+    tl.store(c_ptr + global_m[:, None] * stride_cm + offs_n[None, :] * stride_cn, c, mask=mask)
+
+
+@triton.jit
+def grouped_fused_gemm2_acc_kernel(
+    c_ptr,
+    w_ptr,
+    w_scale_ptr,
+    token_idx_ptr,
+    token_weight_ptr,
+    out_ptr,
+    expert_offsets_ptr,
+    m_tile_offsets_ptr,
+    N,  # HIDDEN_SIZE
+    K,  # INTERMEDIATE_SIZE
+    stride_cm,
+    stride_ck,
+    expert_stride_w,
+    stride_wm,
+    stride_wk,
+    stride_out_m,
+    stride_out_n,
+    expert_stride_scale,
+    stride_scale_n,
+    stride_scale_k,
+    NUM_EXPERTS: tl.constexpr,
+    INPUT_PRECISION: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    SCALE_BLOCK: tl.constexpr,
+):
+    pid_m = tl.program_id(0)
+    pid_n = tl.program_id(1)
+
+    # Binary search for expert_id
+    lo = 0
+    hi = NUM_EXPERTS
+    for _ in tl.static_range(0, 8):
+        mid = (lo + hi) // 2
+        mid_val = tl.load(m_tile_offsets_ptr + mid)
+        lo = tl.where(mid_val <= pid_m, mid, lo)
+        hi = tl.where(mid_val <= pid_m, hi, mid)
+    expert_id = lo
+
+    expert_start = tl.load(expert_offsets_ptr + expert_id)
+    expert_end = tl.load(expert_offsets_ptr + expert_id + 1)
+    M = expert_end - expert_start
+    tile_start = tl.load(m_tile_offsets_ptr + expert_id)
+    local_pid_m = pid_m - tile_start
+
+    offs_m = local_pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+
+    token_ids = tl.load(token_idx_ptr + expert_start + offs_m, mask=offs_m < M, other=0)
+    weights = tl.load(token_weight_ptr + expert_start + offs_m, mask=offs_m < M, other=0.0)
+
+    acc = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
+
+    w_base = w_ptr + expert_id * expert_stride_w
+    scale_base = w_scale_ptr + expert_id * expert_stride_scale
+
+    global_m = expert_start + offs_m
+    for k in range(0, K, BLOCK_K):
+        k_ids = k + offs_k
+        c_ptrs = c_ptr + global_m[:, None] * stride_cm + k_ids[None, :] * stride_ck
+        c = tl.load(c_ptrs, mask=(offs_m[:, None] < M) & (k_ids[None, :] < K), other=0.0)
+        c = tl.cast(c, tl.float32)
+
+        w_ptrs = w_base + k_ids[:, None] * stride_wk + offs_n[None, :] * stride_wm
+        w = tl.load(w_ptrs, mask=(k_ids[:, None] < K) & (offs_n[None, :] < N), other=0.0)
+        w = tl.cast(w, tl.float32)
+
+        n_block = (pid_n * BLOCK_N) // SCALE_BLOCK
+        k_block = k // SCALE_BLOCK
+        scale = tl.load(scale_base + n_block * stride_scale_n + k_block * stride_scale_k)
+        w = w * scale
+
+        acc += tl.dot(c, w, input_precision=INPUT_PRECISION)
+
+    # Multiply by token weight and atomic scatter-add to output (multiple experts may write same token)
+    acc = acc * weights[:, None]
+    mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
+    out_ptrs = out_ptr + token_ids[:, None] * stride_out_m + offs_n[None, :] * stride_out_n
+    tl.atomic_add(out_ptrs, acc, mask=mask)
+
+
 def kernel(
     routing_logits: torch.Tensor,
     routing_bias: torch.Tensor,
@@ -1017,26 +1230,25 @@ def kernel(
             o = c.matmul(w2.t())
             output_fp32.index_add_(0, token_idx, o * token_weight.unsqueeze(1))
     elif total > 0:
-        # Pre-allocate scratch buffers (Step 2)
-        max_m = max(int((expert_offsets[i+1] - expert_offsets[i]).item()) for i in range(NUM_LOCAL_EXPERTS))
-        if max_m > 0:
-            g1_buf = torch.empty((max_m, 2 * INTERMEDIATE_SIZE), device=device, dtype=torch.float32)
-            c_buf = torch.empty((max_m, INTERMEDIATE_SIZE), device=device, dtype=torch.float32)
-
         bm, bn, bk = BLOCK_M, BLOCK_N, BLOCK_K
 
-        # Per expert: GEMM1 -> SwiGLU -> GEMM2 -> accumulate
-        for local_expert in range(NUM_LOCAL_EXPERTS):
-            start = int(expert_offsets[local_expert].item())
-            end = int(expert_offsets[local_expert + 1].item())
-            if start == end:
-                continue
+        if USE_TORCH_GEMM:
+            # Per expert fallback: GEMM1 -> SwiGLU -> GEMM2 -> accumulate
+            max_m = max(int((expert_offsets[i+1] - expert_offsets[i]).item()) for i in range(NUM_LOCAL_EXPERTS))
+            if max_m > 0:
+                g1_buf = torch.empty((max_m, 2 * INTERMEDIATE_SIZE), device=device, dtype=torch.float32)
+                c_buf = torch.empty((max_m, INTERMEDIATE_SIZE), device=device, dtype=torch.float32)
 
-            token_idx_slice = token_indices[start:end]
-            token_weight_slice = token_weights[start:end]
-            m = end - start
+            for local_expert in range(NUM_LOCAL_EXPERTS):
+                start = int(expert_offsets[local_expert].item())
+                end = int(expert_offsets[local_expert + 1].item())
+                if start == end:
+                    continue
 
-            if USE_TORCH_GEMM:
+                token_idx_slice = token_indices[start:end]
+                token_weight_slice = token_weights[start:end]
+                m = end - start
+
                 a_expert = a.index_select(0, token_idx_slice).to(torch.float32)
                 w13 = _block_dequant_matrix(
                     gemm1_weights[local_expert],
@@ -1059,82 +1271,108 @@ def kernel(
                 c = torch.nn.functional.silu(x2) * x1
                 o = c.matmul(w2.t())
                 output_fp32.index_add_(0, token_idx_slice, o * token_weight_slice.unsqueeze(1))
-                continue
+        else:
+            # Grouped kernel path: 3 launches instead of 96
+            # Compute m_tile_offsets on CPU for binary search in kernels
+            expert_offsets_cpu = expert_offsets.cpu()
+            m_tile_counts = torch.zeros(NUM_LOCAL_EXPERTS, dtype=torch.int32)
+            for i in range(NUM_LOCAL_EXPERTS):
+                count = int(expert_offsets_cpu[i + 1].item()) - int(expert_offsets_cpu[i].item())
+                m_tile_counts[i] = triton.cdiv(count, bm) if count > 0 else 0
+            m_tile_offsets = torch.zeros(NUM_LOCAL_EXPERTS + 1, dtype=torch.int32)
+            m_tile_offsets[1:] = torch.cumsum(m_tile_counts, dim=0)
+            total_m_tiles = int(m_tile_offsets[-1].item())
 
-            # GEMM1: FP8 inline dequant
-            g1 = g1_buf[:m]
-            grid_gemm1 = (triton.cdiv(m, bm), triton.cdiv(2 * INTERMEDIATE_SIZE, bn))
-            fp8_gemm_kernel[grid_gemm1](
-                a,
-                gemm1_weights[local_expert],
-                gemm1_weights_scale[local_expert],
-                token_idx_slice,
-                g1,
-                m,
-                2 * INTERMEDIATE_SIZE,
-                HIDDEN_SIZE,
-                a.stride(0),
-                a.stride(1),
-                gemm1_weights[local_expert].stride(0),
-                gemm1_weights[local_expert].stride(1),
-                g1.stride(0),
-                g1.stride(1),
-                gemm1_weights_scale[local_expert].stride(0),
-                gemm1_weights_scale[local_expert].stride(1),
-                INPUT_PRECISION=GEMM1_INPUT_PRECISION,
-                BLOCK_M=bm,
-                BLOCK_N=bn,
-                BLOCK_K=bk,
-                SCALE_BLOCK=BLOCK,
-                num_warps=8,
-                num_stages=3,
-            )
+            if total_m_tiles > 0:
+                m_tile_offsets_dev = m_tile_offsets.to(device)
 
-            # SwiGLU
-            c_slice = c_buf[:m]
-            grid_swiglu = (triton.cdiv(m, bm), triton.cdiv(INTERMEDIATE_SIZE, bn))
-            swiglu_kernel[grid_swiglu](
-                g1,
-                c_slice,
-                m,
-                g1.stride(0),
-                g1.stride(1),
-                c_slice.stride(0),
-                c_slice.stride(1),
-                BLOCK_M=bm,
-                BLOCK_N=bn,
-                INTERMEDIATE_SIZE=INTERMEDIATE_SIZE,
-                num_warps=4,
-                num_stages=2,
-            )
+                # Allocate contiguous scratch buffers for all experts
+                g1_buf = torch.empty((total, 2 * INTERMEDIATE_SIZE), device=device, dtype=torch.float32)
+                c_buf = torch.empty((total, INTERMEDIATE_SIZE), device=device, dtype=torch.float32)
 
-            # GEMM2: FP8 inline dequant + accumulate via fused kernel
-            grid_gemm2 = (triton.cdiv(m, bm), triton.cdiv(HIDDEN_SIZE, bn))
-            fused_gemm2_accumulate_kernel[grid_gemm2](
-                c_slice,
-                gemm2_weights[local_expert],
-                gemm2_weights_scale[local_expert],
-                token_idx_slice,
-                token_weight_slice,
-                output_fp32,
-                m,
-                HIDDEN_SIZE,
-                INTERMEDIATE_SIZE,
-                c_slice.stride(0),
-                c_slice.stride(1),
-                gemm2_weights[local_expert].stride(0),
-                gemm2_weights[local_expert].stride(1),
-                output_fp32.stride(0),
-                output_fp32.stride(1),
-                gemm2_weights_scale[local_expert].stride(0),
-                gemm2_weights_scale[local_expert].stride(1),
-                INPUT_PRECISION=GEMM2_INPUT_PRECISION,
-                BLOCK_M=bm,
-                BLOCK_N=bn,
-                BLOCK_K=bk,
-                SCALE_BLOCK=BLOCK,
-                num_warps=8,
-                num_stages=2,
-            )
+                # Grouped GEMM1: all experts in one launch
+                grid_gemm1 = (total_m_tiles, triton.cdiv(2 * INTERMEDIATE_SIZE, bn))
+                grouped_fp8_gemm1_kernel[grid_gemm1](
+                    a,
+                    gemm1_weights,
+                    gemm1_weights_scale,
+                    token_indices,
+                    g1_buf,
+                    expert_offsets,
+                    m_tile_offsets_dev,
+                    2 * INTERMEDIATE_SIZE,
+                    HIDDEN_SIZE,
+                    a.stride(0),
+                    a.stride(1),
+                    gemm1_weights.stride(0),
+                    gemm1_weights.stride(1),
+                    gemm1_weights.stride(2),
+                    g1_buf.stride(0),
+                    g1_buf.stride(1),
+                    gemm1_weights_scale.stride(0),
+                    gemm1_weights_scale.stride(1),
+                    gemm1_weights_scale.stride(2),
+                    total,
+                    NUM_EXPERTS=NUM_LOCAL_EXPERTS,
+                    INPUT_PRECISION=GEMM1_INPUT_PRECISION,
+                    BLOCK_M=bm,
+                    BLOCK_N=bn,
+                    BLOCK_K=bk,
+                    SCALE_BLOCK=BLOCK,
+                    num_warps=8,
+                    num_stages=3,
+                )
+
+                # Grouped SwiGLU: all experts in one launch
+                grid_swiglu = (total_m_tiles, triton.cdiv(INTERMEDIATE_SIZE, bn))
+                grouped_swiglu_kernel[grid_swiglu](
+                    g1_buf,
+                    c_buf,
+                    expert_offsets,
+                    m_tile_offsets_dev,
+                    g1_buf.stride(0),
+                    g1_buf.stride(1),
+                    c_buf.stride(0),
+                    c_buf.stride(1),
+                    NUM_EXPERTS=NUM_LOCAL_EXPERTS,
+                    BLOCK_M=bm,
+                    BLOCK_N=bn,
+                    INTERMEDIATE_SIZE=INTERMEDIATE_SIZE,
+                    num_warps=4,
+                    num_stages=2,
+                )
+
+                # Grouped fused GEMM2 + accumulate: all experts in one launch
+                grid_gemm2 = (total_m_tiles, triton.cdiv(HIDDEN_SIZE, bn))
+                grouped_fused_gemm2_acc_kernel[grid_gemm2](
+                    c_buf,
+                    gemm2_weights,
+                    gemm2_weights_scale,
+                    token_indices,
+                    token_weights,
+                    output_fp32,
+                    expert_offsets,
+                    m_tile_offsets_dev,
+                    HIDDEN_SIZE,
+                    INTERMEDIATE_SIZE,
+                    c_buf.stride(0),
+                    c_buf.stride(1),
+                    gemm2_weights.stride(0),
+                    gemm2_weights.stride(1),
+                    gemm2_weights.stride(2),
+                    output_fp32.stride(0),
+                    output_fp32.stride(1),
+                    gemm2_weights_scale.stride(0),
+                    gemm2_weights_scale.stride(1),
+                    gemm2_weights_scale.stride(2),
+                    NUM_EXPERTS=NUM_LOCAL_EXPERTS,
+                    INPUT_PRECISION=GEMM2_INPUT_PRECISION,
+                    BLOCK_M=bm,
+                    BLOCK_N=bn,
+                    BLOCK_K=bk,
+                    SCALE_BLOCK=BLOCK,
+                    num_warps=8,
+                    num_stages=2,
+                )
 
     output.copy_(output_fp32.to(torch.bfloat16))
