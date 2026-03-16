@@ -521,4 +521,4 @@ def kernel(
                 num_stages=2,
             )
 
-    output.copy_(output_fp32.to(torch.bfloat16))
+    output.copy_(output_fp32)
