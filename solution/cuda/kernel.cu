@@ -134,7 +134,7 @@ static void cutlass_sgemm(cudaStream_t stream, int M, int N, int K,
     if (gemm.can_implement(args) == cutlass::Status::kSuccess) {
         gemm.initialize(args, g_cws.p, stream);
         gemm.run(args, g_cws.p, stream);
-        cudaStreamSynchronize(stream);  // Ensure GEMM done before next init overwrites TMA
+        // No sync needed — stream ordering ensures sequential execution
     } else {
         // Fallback: zero output for unsupported sizes
         cudaMemsetAsync(D, 0, (int64_t)M * N * 4, stream);
