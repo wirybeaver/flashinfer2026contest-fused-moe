@@ -32,7 +32,7 @@ using namespace cute;
 static constexpr int H = 7168, I_DIM = 2048, G1 = 4096;
 static constexpr int NE = 256, NL = 32, TK = 8, NG = 8, TG = 4, QB = 128;
 static constexpr int GS = NE/NG, NHB = H/QB, NIB = I_DIM/QB, NG1B = G1/QB, MC = 512;
-static constexpr int NS = 4; // number of parallel streams
+static constexpr int NS = 8; // number of parallel streams
 
 static inline cudaStream_t get_stream() {
     int d; cudaGetDevice(&d);
