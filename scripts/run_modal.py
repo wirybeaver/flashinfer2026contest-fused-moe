@@ -41,10 +41,10 @@ image = (
     .pip_install("flashinfer-bench", "triton", "numpy")
     .add_local_file("/tmp/cutlass_headers.tar.gz", "/tmp/cutlass_headers.tar.gz", copy=True)
     .run_commands(
-        # Install CUTLASS 4.4.2 headers from ~/cutlass
+        # Install CUTLASS 4.4.2 headers
         "cd /usr/local/include && tar xzf /tmp/cutlass_headers.tar.gz --strip-components=1 include/ && "
         "tar xzf /tmp/cutlass_headers.tar.gz --strip-components=3 tools/util/include/ && "
-        "echo 'CUTLASS 4.4.2 headers installed'",
+        "echo 'CUTLASS 4.4.2 installed'",
     )
 )
 
