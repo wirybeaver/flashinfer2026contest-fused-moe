@@ -1,5 +1,5 @@
 /*
- * CUDA Fused MoE — CUTLASS SM100 TF32 GEMM per-expert.
+ * CUDA Fused MoE — CUTLASS SM100 TF32 GEMM with multi-stream parallelism.
  * Native Blackwell UMMA tensor cores + TMA.
  * Target: B200 (sm_100a). Output: bfloat16.
  */
@@ -32,6 +32,7 @@ using namespace cute;
 static constexpr int H = 7168, I_DIM = 2048, G1 = 4096;
 static constexpr int NE = 256, NL = 32, TK = 8, NG = 8, TG = 4, QB = 128;
 static constexpr int GS = NE/NG, NHB = H/QB, NIB = I_DIM/QB, NG1B = G1/QB, MC = 512;
+static constexpr int NS = 4; // number of parallel streams
 
 static inline cudaStream_t get_stream() {
     int d; cudaGetDevice(&d);
@@ -41,10 +42,7 @@ __device__ __forceinline__ float fp8f(uint8_t v) {
     __nv_fp8_e4m3 f; f.__x = v; return float(f);
 }
 
-// ============================================================
-// CUTLASS SM100 TF32 GEMM (RowMajor A, RowMajor B, RowMajor D)
-// D[M,N] = A[M,K] * B^T[K,N] where both A,B stored RowMajor (K contiguous)
-// ============================================================
+// CUTLASS SM100 TF32 GEMM
 using GemmSched = cutlass::gemm::KernelTmaWarpSpecialized1SmSm100;
 using GemmEpiSched = cutlass::epilogue::collective::EpilogueScheduleAuto;
 using GemmTile = Shape<_128, _128, _32>;
@@ -55,8 +53,8 @@ using GemmEpi = typename cutlass::epilogue::collective::CollectiveBuilder<
     cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
     GemmTile, GemmCluster, cutlass::epilogue::collective::EpilogueTileAuto,
     float, float,
-    float, cutlass::layout::RowMajor, GA,       // C: RowMajor
-    float, cutlass::layout::RowMajor, GA,       // D: RowMajor output
+    float, cutlass::layout::RowMajor, GA,
+    float, cutlass::layout::RowMajor, GA,
     GemmEpiSched,
     cutlass::epilogue::fusion::LinearCombination<float, float>
 >::CollectiveOp;
@@ -64,7 +62,7 @@ using GemmEpi = typename cutlass::epilogue::collective::CollectiveBuilder<
 using GemmML = typename cutlass::gemm::collective::CollectiveBuilder<
     cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
     float, cutlass::layout::RowMajor, GA,       // A: RowMajor (K contiguous)
-    float, cutlass::layout::ColumnMajor, GA,   // B: ColumnMajor (K contiguous)
+    float, cutlass::layout::ColumnMajor, GA,     // B: ColumnMajor (K contiguous)
     float, GemmTile, GemmCluster,
     cutlass::gemm::collective::StageCountAutoCarveout<
         static_cast<int>(sizeof(typename GemmEpi::SharedStorage))>,
@@ -74,14 +72,11 @@ using GemmML = typename cutlass::gemm::collective::CollectiveBuilder<
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int,int,int,int>, GemmML, GemmEpi>;
 using CutlassGemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
-// ============================================================
 // CUDA kernels
-// ============================================================
 __global__ void routing_kernel(const float*__restrict__ lg, const __nv_bfloat16*__restrict__ bi,
     int*__restrict__ ti, float*__restrict__ tw, int S, float sf) {
     int t=threadIdx.x, tok=blockIdx.x; if(tok>=S) return;
-    float s=1.0f/(1.0f+expf(-lg[tok*NE+t]));
-    float sb=s+__bfloat162float(bi[t]);
+    float s=1.0f/(1.0f+expf(-lg[tok*NE+t])); float sb=s+__bfloat162float(bi[t]);
     __shared__ float ss[NE], sg[NE]; ss[t]=sb; sg[t]=s; __syncthreads();
     if(t==0) {
         float gs[NG]; for(int g=0;g<NG;g++){int b=g*GS;float m1=-FLT_MAX,m2=-FLT_MAX;for(int i=0;i<GS;i++){float v=ss[b+i];if(v>m1){m2=m1;m1=v;}else if(v>m2)m2=v;}gs[g]=m1+m2;}
@@ -104,11 +99,23 @@ __global__ void f2b(const float*in,__nv_bfloat16*out,int n){int i=blockIdx.x*blo
 struct WS{void*p=nullptr;size_t sz=0;
     void ensure(size_t n){if(n<=sz&&p)return;if(p)cudaFree(p);if(cudaMalloc(&p,n)!=cudaSuccess){p=nullptr;sz=0;return;}sz=n;}
 };
-static WS g_ws, g_cws;
+static WS g_ws, g_cws[NS];
+static cudaStream_t s_st[NS] = {};
+static cudaEvent_t s_re = nullptr, s_se[NS] = {};
+static bool s_init = false;
 
-// Helper: run CUTLASS GEMM for one expert
-// C[M,N] = A[M,K] * B[N,K]^T, all RowMajor (K contiguous)
-static void cutlass_sgemm(cudaStream_t stream, int M, int N, int K,
+static void init_streams() {
+    if (s_init) return;
+    for (int i = 0; i < NS; i++) {
+        cudaStreamCreate(&s_st[i]);
+        cudaEventCreateWithFlags(&s_se[i], cudaEventDisableTiming);
+    }
+    cudaEventCreateWithFlags(&s_re, cudaEventDisableTiming);
+    s_init = true;
+}
+
+// CUTLASS GEMM helper — uses per-stream CUTLASS workspace
+static void cutlass_sgemm(int sid, cudaStream_t stream, int M, int N, int K,
                           const float* A, const float* B, float* D) {
     using SA = typename GemmKernel::StrideA;
     using SB = typename GemmKernel::StrideB;
@@ -129,14 +136,12 @@ static void cutlass_sgemm(cudaStream_t stream, int M, int N, int K,
 
     CutlassGemm gemm;
     size_t ws = CutlassGemm::get_workspace_size(args);
-    g_cws.ensure(ws > 0 ? ws : 256);
+    g_cws[sid].ensure(ws > 0 ? ws : 256);
 
     if (gemm.can_implement(args) == cutlass::Status::kSuccess) {
-        gemm.initialize(args, g_cws.p, stream);
-        gemm.run(args, g_cws.p, stream);
-        // No sync needed — stream ordering ensures sequential execution
+        gemm.initialize(args, g_cws[sid].p, stream);
+        gemm.run(args, g_cws[sid].p, stream);
     } else {
-        // Fallback: zero output for unsupported sizes
         cudaMemsetAsync(D, 0, (int64_t)M * N * 4, stream);
     }
 }
@@ -150,6 +155,7 @@ void KernelFunc(
     TensorView output
 ) {
     cudaStream_t stream = get_stream();
+    init_streams();
     int S = (int)routing_logits.size(0);
     auto*logp=static_cast<const float*>(routing_logits.data_ptr());
     auto*biap=static_cast<const __nv_bfloat16*>(routing_bias.data_ptr());
@@ -164,7 +170,6 @@ void KernelFunc(
     int leo=(int)local_expert_offset;
     int64_t tot=(int64_t)S*TK;
 
-    // Workspace: align each buffer to 256 bytes for TMA compatibility
     auto align256 = [](size_t x) -> size_t { return (x + 255) & ~(size_t)255; };
     size_t n=0;
     size_t o_tki=n;n=align256(n+tot*4);
@@ -175,12 +180,17 @@ void KernelFunc(
     size_t o_toi=n;n=align256(n+tot*4);
     size_t o_tow=n;n=align256(n+tot*4);
     size_t o_ofp=n;n=align256(n+(int64_t)S*H*4);
-    size_t o_w1f=n;n=align256(n+(int64_t)G1*H*4);
-    size_t o_w2f=n;n=align256(n+(int64_t)H*I_DIM*4);
-    size_t o_ag=n;n=align256(n+(int64_t)MC*H*4);
-    size_t o_g1=n;n=align256(n+(int64_t)MC*G1*4);
-    size_t o_sg=n;n=align256(n+(int64_t)MC*I_DIM*4);
-    size_t o_g2=n;n=align256(n+(int64_t)MC*H*4);
+
+    // Per-stream buffers (NS copies)
+    size_t ps=0;
+    size_t pw1=ps;ps=align256(ps+(int64_t)G1*H*4);
+    size_t pw2=ps;ps=align256(ps+(int64_t)H*I_DIM*4);
+    size_t pag=ps;ps=align256(ps+(int64_t)MC*H*4);
+    size_t pg1=ps;ps=align256(ps+(int64_t)MC*G1*4);
+    size_t psg=ps;ps=align256(ps+(int64_t)MC*I_DIM*4);
+    size_t pg2=ps;ps=align256(ps+(int64_t)MC*H*4);
+
+    size_t o_st=n; n+=ps*NS;
 
     g_ws.ensure(n);
     if (!g_ws.p) return;
@@ -188,13 +198,9 @@ void KernelFunc(
     int*tki=(int*)(b+o_tki);float*tkw=(float*)(b+o_tkw);
     int*ec=(int*)(b+o_ec);int*eod=(int*)(b+o_eod);int*ep=(int*)(b+o_ep);
     int*toi=(int*)(b+o_toi);float*tow=(float*)(b+o_tow);float*ofp=(float*)(b+o_ofp);
-    float*w1f=(float*)(b+o_w1f);float*w2f=(float*)(b+o_w2f);
-    float*ag=(float*)(b+o_ag);float*g1b=(float*)(b+o_g1);
-    float*sgb=(float*)(b+o_sg);float*g2b=(float*)(b+o_g2);
 
     cudaMemsetAsync(ofp,0,(int64_t)S*H*4,stream);
 
-    // Routing
     routing_kernel<<<S,NE,0,stream>>>(logp,biap,tki,tkw,S,(float)routed_scaling_factor);
     cudaMemsetAsync(ec,0,NL*4,stream);
     count_k<<<S,TK,0,stream>>>(tki,ec,S,leo);
@@ -207,34 +213,40 @@ void KernelFunc(
     cudaStreamSynchronize(stream);
     if(ho[NL]==0){f2b<<<((S*H)+255)/256,256,0,stream>>>(ofp,outp,S*H);cudaStreamSynchronize(stream);return;}
 
-    // Per-expert loop: dequant weights, gather activations, CUTLASS GEMM, SwiGLU, GEMM, accum
+    cudaEventRecord(s_re, stream);
+
+    // Multi-stream expert loop
+    bool sw[NS] = {};
     for(int e=0;e<NL;e++){
         int st=ho[e], Me=ho[e+1]-st;
         if(!Me) continue;
+        int sid = e % NS;
+        cudaStream_t ws = s_st[sid];
+        char*sb = b + o_st + ps * sid;
+        float*w1f=(float*)(sb+pw1); float*w2f=(float*)(sb+pw2);
+        float*ag=(float*)(sb+pag); float*g1b=(float*)(sb+pg1);
+        float*sgb=(float*)(sb+psg); float*g2b=(float*)(sb+pg2);
 
-        // Dequant weights for this expert
-        {int nn=G1*H;dequant_w<<<(nn+255)/256,256,0,stream>>>(g1wp+(int64_t)e*G1*H,g1sp+(int64_t)e*NG1B*NHB,w1f,G1,H,NHB);}
-        {int nn=H*I_DIM;dequant_w<<<(nn+255)/256,256,0,stream>>>(g2wp+(int64_t)e*H*I_DIM,g2sp+(int64_t)e*NHB*NIB,w2f,H,I_DIM,NIB);}
+        if(!sw[sid]){ cudaStreamWaitEvent(ws, s_re); sw[sid]=true; }
+
+        {int nn=G1*H;dequant_w<<<(nn+255)/256,256,0,ws>>>(g1wp+(int64_t)e*G1*H,g1sp+(int64_t)e*NG1B*NHB,w1f,G1,H,NHB);}
+        {int nn=H*I_DIM;dequant_w<<<(nn+255)/256,256,0,ws>>>(g2wp+(int64_t)e*H*I_DIM,g2sp+(int64_t)e*NHB*NIB,w2f,H,I_DIM,NIB);}
 
         for(int c0=0;c0<Me;c0+=MC){
             int M=(Me-c0<MC)?Me-c0:MC;
             int*eti=toi+st+c0; float*etw=tow+st+c0;
 
-            // Dequant+gather hidden states
-            {int nn=M*H;fused_dequant_gather<<<(nn+255)/256,256,0,stream>>>(hsp,hssp,eti,ag,M,as0,as1);}
-
-            // CUTLASS GEMM1: D[M,G1] = ag[M,H] * w1f[G1,H]^T
-            cutlass_sgemm(stream, M, G1, H, ag, w1f, g1b);
-
-            // SwiGLU
-            {int nn=M*I_DIM;swiglu_k<<<(nn+255)/256,256,0,stream>>>(g1b,sgb,M);}
-
-            // CUTLASS GEMM2: g2b[M,H] = sgb[M,I] * w2f[H,I]^T
-            cutlass_sgemm(stream, M, H, I_DIM, sgb, w2f, g2b);
-
-            // Accumulate
-            {dim3 grid((H+255)/256,M);accum_k<<<grid,256,0,stream>>>(g2b,eti,etw,ofp,M);}
+            {int nn=M*H;fused_dequant_gather<<<(nn+255)/256,256,0,ws>>>(hsp,hssp,eti,ag,M,as0,as1);}
+            cutlass_sgemm(sid, ws, M, G1, H, ag, w1f, g1b);
+            {int nn=M*I_DIM;swiglu_k<<<(nn+255)/256,256,0,ws>>>(g1b,sgb,M);}
+            cutlass_sgemm(sid, ws, M, H, I_DIM, sgb, w2f, g2b);
+            {dim3 grid((H+255)/256,M);accum_k<<<grid,256,0,ws>>>(g2b,eti,etw,ofp,M);}
         }
+    }
+
+    for(int i=0;i<NS;i++){
+        cudaEventRecord(s_se[i], s_st[i]);
+        cudaStreamWaitEvent(stream, s_se[i]);
     }
 
     f2b<<<((S*H)+255)/256,256,0,stream>>>(ofp,outp,S*H);
