@@ -17,7 +17,6 @@
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
-#include "cutlass/gemm/group_array_problem_shape.hpp"
 #include "cutlass/util/packed_stride.hpp"
 
 #include <tvm/ffi/container/tensor.h>
@@ -32,7 +31,7 @@ using namespace cute;
 
 static constexpr int H = 7168, I_DIM = 2048, G1 = 4096;
 static constexpr int NE = 256, NL = 32, TK = 8, NG = 8, TG = 4, QB = 128;
-static constexpr int GS = NE/NG, NHB = H/QB, NIB = I_DIM/QB, NG1B = G1/QB, MC = 512;
+static constexpr int GS = NE/NG, NHB = H/QB, NIB = I_DIM/QB, NG1B = G1/QB, MC = 2048;
 static constexpr int NS = 8; // number of parallel streams
 
 static inline cudaStream_t get_stream() {
@@ -44,10 +43,10 @@ __device__ __forceinline__ float fp8f(uint8_t v) {
 }
 
 // CUTLASS SM100 TF32 GEMM
-using GemmSched = cutlass::gemm::KernelTmaWarpSpecialized1SmSm100;
+using GemmSched = cutlass::gemm::KernelTmaWarpSpecialized2SmSm100;
 using GemmEpiSched = cutlass::epilogue::collective::EpilogueScheduleAuto;
 using GemmTile = Shape<_128, _128, _32>;
-using GemmCluster = Shape<_1, _1, _1>;
+using GemmCluster = Shape<_2, _1, _1>;  // 2-SM cluster
 static constexpr int GA = 4;
 
 using GemmEpi = typename cutlass::epilogue::collective::CollectiveBuilder<
@@ -73,30 +72,6 @@ using GemmML = typename cutlass::gemm::collective::CollectiveBuilder<
 using GemmKernel = cutlass::gemm::kernel::GemmUniversal<Shape<int,int,int,int>, GemmML, GemmEpi>;
 using CutlassGemm = cutlass::gemm::device::GemmUniversalAdapter<GemmKernel>;
 
-// Grouped GEMM using MoEProblemShape + Mixed TMA/CPASYNC
-using GrpSched = cutlass::gemm::KernelMixedTmaCpAsyncWarpSpecialized1SmSm100;
-using GrpEpi = typename cutlass::epilogue::collective::CollectiveBuilder<
-    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
-    GemmTile, GemmCluster, cutlass::epilogue::collective::EpilogueTileAuto,
-    float, float,
-    float, cutlass::layout::RowMajor, GA,
-    float, cutlass::layout::RowMajor, GA,
-    GemmEpiSched,
-    cutlass::epilogue::fusion::LinearCombination<float, float>
->::CollectiveOp;
-using GrpML = typename cutlass::gemm::collective::CollectiveBuilder<
-    cutlass::arch::Sm100, cutlass::arch::OpClassTensorOp,
-    float, cutlass::layout::RowMajor, GA,
-    float, cutlass::layout::ColumnMajor, GA,
-    float, GemmTile, GemmCluster,
-    cutlass::gemm::collective::StageCountAutoCarveout<
-        static_cast<int>(sizeof(typename GrpEpi::SharedStorage))>,
-    GrpSched
->::CollectiveOp;
-using GrpPS = cutlass::gemm::MoEProblemShape<Shape<int,int,int>>;
-using GrpKernel = cutlass::gemm::kernel::GemmUniversal<GrpPS, GrpML, GrpEpi>;
-using GrpGemm = cutlass::gemm::device::GemmUniversalAdapter<GrpKernel>;
-
 // CUDA kernels
 __global__ void routing_kernel(const float*__restrict__ lg, const __nv_bfloat16*__restrict__ bi,
     int*__restrict__ ti, float*__restrict__ tw, int S, float sf) {
@@ -117,49 +92,6 @@ __global__ void prefix_sum_k(const int*c,int*o){if(threadIdx.x!=0)return;int s=0
 __global__ void scatter_k(const int*ti,const float*tw,int*toi,float*tow,const int*eo,int*ep,int S,int leo){int tok=blockIdx.x;if(tok>=S)return;int k=threadIdx.x;if(k>=TK)return;int le=ti[tok*TK+k]-leo;if(le>=0&&le<NL){int p=atomicAdd(&ep[le],1);toi[eo[le]+p]=tok;tow[eo[le]+p]=tw[tok*TK+k];}}
 __global__ void dequant_w(const uint8_t*w,const float*sc,float*out,int N,int K,int nkb){int idx=blockIdx.x*blockDim.x+threadIdx.x;if(idx>=N*K)return;out[idx]=fp8f(w[idx])*sc[(idx/K/QB)*nkb+(idx%K)/QB];}
 __global__ void fused_dequant_gather(const uint8_t*hs,const float*sc,const int*ti,float*out,int M,int as0,int as1){int idx=blockIdx.x*blockDim.x+threadIdx.x;if(idx>=M*H)return;int m=idx/H,h=idx%H;int tok=ti[m];out[idx]=fp8f(hs[(int64_t)tok*H+h])*sc[(h/QB)*as0+tok*as1];}
-// Dequant ALL experts' weights
-__global__ void dequant_w_all(const uint8_t*w,const float*sc,float*out,int N,int K,int nkb){
-    int64_t idx=(int64_t)blockIdx.x*blockDim.x+threadIdx.x;
-    int64_t total=(int64_t)NL*N*K; if(idx>=total)return;
-    int expert=(int)(idx/(N*K)); int li=(int)(idx%(N*K));
-    out[idx]=fp8f(w[idx])*sc[(int64_t)expert*(N/QB)*nkb+(li/K/QB)*nkb+(li%K)/QB];
-}
-// Padded gather: out[expert*maxN*K + m*K + h]
-__global__ void gather_padded(const uint8_t*hs,const float*sc,const int*toi,const int*eo,
-    float*out,int maxN,int K_dim,int as0,int as1){
-    int64_t idx=(int64_t)blockIdx.x*blockDim.x+threadIdx.x;
-    int64_t total=(int64_t)NL*maxN*K_dim; if(idx>=total)return;
-    int expert=(int)(idx/((int64_t)maxN*K_dim));
-    int li=(int)(idx%((int64_t)maxN*K_dim));
-    int lm=li/K_dim,h=li%K_dim;
-    int es=eo[expert],eM=eo[expert+1]-es;
-    if(lm<eM){int tok=toi[es+lm];out[idx]=fp8f(hs[(int64_t)tok*K_dim+h])*sc[(h/QB)*as0+tok*as1];}
-    else out[idx]=0.0f;
-}
-// Padded SwiGLU: g1 is RowMajor [maxN, G1] per expert
-__global__ void swiglu_pad(const float*g1,float*out,const int*eo,int maxN){
-    int64_t idx=(int64_t)blockIdx.x*blockDim.x+threadIdx.x;
-    int64_t total=(int64_t)NL*maxN*I_DIM; if(idx>=total)return;
-    int expert=(int)(idx/((int64_t)maxN*I_DIM));
-    int li=(int)(idx%((int64_t)maxN*I_DIM));
-    int lm=li/I_DIM,i=li%I_DIM;
-    if(lm>=eo[expert+1]-eo[expert])return;
-    int64_t base=(int64_t)expert*maxN*G1;
-    float x1=g1[base+lm*G1+i],x2=g1[base+lm*G1+I_DIM+i];
-    out[(int64_t)expert*maxN*I_DIM+lm*I_DIM+i]=x2/(1.0f+expf(-x2))*x1;
-}
-// Padded accum: g2 is RowMajor [maxN, H] per expert
-__global__ void accum_pad(const float*g2,const int*toi,const float*tow,const int*eo,float*out,int maxN){
-    int64_t idx=(int64_t)blockIdx.x*blockDim.x+threadIdx.x;
-    int64_t total=(int64_t)NL*maxN*H; if(idx>=total)return;
-    int expert=(int)(idx/((int64_t)maxN*H));
-    int li=(int)(idx%((int64_t)maxN*H));
-    int lm=li/H,h=li%H;
-    int es=eo[expert],eM=eo[expert+1]-es;
-    if(lm>=eM)return;
-    int gm=es+lm;
-    atomicAdd(&out[toi[gm]*H+h],g2[(int64_t)expert*maxN*H+lm*H+h]*tow[gm]);
-}
 __global__ void swiglu_k(const float*g1,float*out,int M){int idx=blockIdx.x*blockDim.x+threadIdx.x;if(idx>=M*I_DIM)return;int m=idx/I_DIM,i=idx%I_DIM;float x1=g1[m*G1+i],x2=g1[m*G1+I_DIM+i];out[m*I_DIM+i]=x2/(1.0f+expf(-x2))*x1;}
 __global__ void accum_k(const float*g2,const int*ti,const float*tw,float*out,int M){int m=blockIdx.y;if(m>=M)return;int h=blockIdx.x*blockDim.x+threadIdx.x;if(h>=H)return;atomicAdd(&out[ti[m]*H+h],g2[m*H+h]*tw[m]);}
 __global__ void f2b(const float*in,__nv_bfloat16*out,int n){int i=blockIdx.x*blockDim.x+threadIdx.x;if(i<n)out[i]=__float2bfloat16(in[i]);}
@@ -167,44 +99,11 @@ __global__ void f2b(const float*in,__nv_bfloat16*out,int n){int i=blockIdx.x*blo
 struct WS{void*p=nullptr;size_t sz=0;
     void ensure(size_t n){if(n<=sz&&p)return;if(p)cudaFree(p);if(cudaMalloc(&p,n)!=cudaSuccess){p=nullptr;sz=0;return;}sz=n;}
 };
-static WS g_ws, g_cws[NS], g_grp_ws;
+static WS g_ws, g_cws[NS];
 static cudaStream_t s_st[NS] = {};
 static cudaEvent_t s_re = nullptr, s_se[NS] = {};
 static bool s_init = false;
 
-// Grouped GEMM: all experts in ONE launch
-// A = weights [NL*M*K contiguous], B = activations [NL*maxN*K padded], D = output [NL*M*maxN padded]
-static bool try_grouped_gemm(cudaStream_t stream, int M_dim, int maxN, int K_dim, int ngroups,
-                              int32_t* tpe_dev, int32_t* tpe_host,
-                              const float* A, const float* B, float* D) {
-    GrpPS problem{M_dim, maxN, K_dim, ngroups, tpe_dev};
-    problem.tokens_per_expert_host = tpe_host;
-
-    auto ps = cute::append<4>(problem.get_host_problem_shape(0), problem.groups());
-    auto [pM, pN, pK, pL] = ps;
-
-    using SC = typename GrpKernel::StrideC;
-    using SD = typename GrpKernel::StrideD;
-    SC sc = cutlass::make_cute_packed_stride(SC{}, make_shape(pM, pN, pL));
-    SD sd = cutlass::make_cute_packed_stride(SD{}, make_shape(pM, pN, pL));
-
-    cutlass::KernelHardwareInfo hw;
-    hw.device_id = 0;
-    hw.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(0);
-
-    typename GrpGemm::Arguments args{
-        cutlass::gemm::GemmUniversalMode::kGrouped, problem,
-        {A, B}, {{1.0f, 0.0f}, D, sc, D, sd}, hw};
-
-    GrpGemm gemm;
-    size_t ws = GrpGemm::get_workspace_size(args);
-    g_grp_ws.ensure(ws > 0 ? ws : 256);
-
-    if (gemm.can_implement(args) != cutlass::Status::kSuccess) return false;
-    gemm.initialize(args, g_grp_ws.p, stream);
-    gemm.run(args, g_grp_ws.p, stream);
-    return true;
-}
 
 static void init_streams() {
     if (s_init) return;
