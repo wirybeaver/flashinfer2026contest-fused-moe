@@ -39,12 +39,21 @@ image = (
         "ln -sf /usr/local/cuda-12.8/bin/nvcc /usr/local/bin/nvcc || true",
     )
     .pip_install("flashinfer-bench", "triton", "numpy")
+    .add_local_file("/tmp/cutlass_headers.tar.gz", "/tmp/cutlass_headers.tar.gz", copy=True)
+    .run_commands(
+        # Install CUTLASS 4.4.2 headers from ~/cutlass
+        "cd /usr/local/include && tar xzf /tmp/cutlass_headers.tar.gz --strip-components=1 include/ && "
+        "tar xzf /tmp/cutlass_headers.tar.gz --strip-components=3 tools/util/include/ && "
+        "echo 'CUTLASS 4.4.2 headers installed'",
+    )
 )
 
 
 @app.function(image=image, gpu="B200:1", timeout=3600, volumes={VOLUME_MOUNT_PATH: trace_volume})
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
+    import os
+    os.environ["TVM_FFI_CUDA_ARCH_LIST"] = "10.0a"  # Enable sm_100a for TMA/UMMA support
     if config is None:
         config = BenchmarkConfig(warmup_runs=3, iterations=100, num_trials=5)
 
