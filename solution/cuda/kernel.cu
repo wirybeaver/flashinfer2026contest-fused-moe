@@ -129,17 +129,31 @@ static void init_streams() {
     s_init = true;
 }
 
-// CuTe GEMM helper — launches cute_gemm_tf32 kernel
-// D[M,N] = A[M,K] * B[N,K]^T, all K-contiguous
+// CuTe GEMM helpers
 static int s_cute_smem = 0;
 static void cute_sgemm(cudaStream_t stream, int M, int N, int K,
                         const float* A, const float* B, float* D) {
     if (s_cute_smem == 0) {
         s_cute_smem = 200 * 1024;
         cudaFuncSetAttribute(cute_gemm_tf32<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, s_cute_smem);
+        cudaFuncSetAttribute(cute_gemm_fp8dq<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, s_cute_smem);
     }
     dim3 grid((M + 127) / 128, (N + 127) / 128);
     cute_gemm_tf32<16><<<grid, 128, s_cute_smem, stream>>>(A, K, B, K, D, N, M, N, K);
+}
+
+// FP8 dequant GEMM: D[M,N] = A_f32[M,K] * (B_fp8[N,K] * scale[N/128, K/128])^T
+// Eliminates weight materialization!
+static void cute_fp8_gemm(cudaStream_t stream, int M, int N, int K,
+                           const float* A, const uint8_t* B_fp8,
+                           const float* B_scale, int scale_stride,
+                           float* D) {
+    if (s_cute_smem == 0) {
+        s_cute_smem = 200 * 1024;
+        cudaFuncSetAttribute(cute_gemm_fp8dq<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, s_cute_smem);
+    }
+    dim3 grid((M + 127) / 128, (N + 127) / 128);
+    cute_gemm_fp8dq<16><<<grid, 128, s_cute_smem, stream>>>(A, K, B_fp8, K, B_scale, scale_stride, D, N, M, N, K);
 }
 
 // CUTLASS GEMM (existing, fallback)
@@ -209,10 +223,8 @@ void KernelFunc(
     size_t o_tow=n;n=align256(n+tot*4);
     size_t o_ofp=n;n=align256(n+(int64_t)S*H*4);
 
-    // Per-stream buffers
+    // Per-stream buffers: NO weight buffers needed! (FP8 dequant inline)
     size_t ps=0;
-    size_t pw1=ps;ps=align256(ps+(int64_t)G1*H*4);
-    size_t pw2=ps;ps=align256(ps+(int64_t)H*I_DIM*4);
     size_t pag=ps;ps=align256(ps+(int64_t)MC*H*4);
     size_t pg1=ps;ps=align256(ps+(int64_t)MC*G1*4);
     size_t psg=ps;ps=align256(ps+(int64_t)MC*I_DIM*4);
@@ -251,23 +263,30 @@ void KernelFunc(
         int sid = e % NS;
         cudaStream_t ws = s_st[sid];
         char*sb = b + o_st + ps * sid;
-        float*w1f=(float*)(sb+pw1); float*w2f=(float*)(sb+pw2);
         float*ag=(float*)(sb+pag); float*g1b=(float*)(sb+pg1);
         float*sgb=(float*)(sb+psg); float*g2b=(float*)(sb+pg2);
 
         if(!sw[sid]){ cudaStreamWaitEvent(ws, s_re); sw[sid]=true; }
 
-        {int nn=G1*H;dequant_w<<<(nn+255)/256,256,0,ws>>>(g1wp+(int64_t)e*G1*H,g1sp+(int64_t)e*NG1B*NHB,w1f,G1,H,NHB);}
-        {int nn=H*I_DIM;dequant_w<<<(nn+255)/256,256,0,ws>>>(g2wp+(int64_t)e*H*I_DIM,g2sp+(int64_t)e*NHB*NIB,w2f,H,I_DIM,NIB);}
+        // NO weight materialization — FP8 dequant done inline in CuTe GEMM!
+        // (Skip dequant_w entirely)
 
         for(int c0=0;c0<Me;c0+=MC){
             int M=(Me-c0<MC)?Me-c0:MC;
             int*eti=toi+st+c0; float*etw=tow+st+c0;
 
             {int nn=M*H;fused_dequant_gather<<<(nn+255)/256,256,0,ws>>>(hsp,hssp,eti,ag,M,as0,as1);}
-            cute_sgemm(ws, M, G1, H, ag, w1f, g1b);
+
+            // GEMM1 with inline FP8 weight dequant
+            cute_fp8_gemm(ws, M, G1, H, ag,
+                          g1wp+(int64_t)e*G1*H, g1sp+(int64_t)e*NG1B*NHB, NHB, g1b);
+
             {int nn=M*I_DIM;swiglu_k<<<(nn+255)/256,256,0,ws>>>(g1b,sgb,M);}
-            cute_sgemm(ws, M, H, I_DIM, sgb, w2f, g2b);
+
+            // GEMM2 with inline FP8 weight dequant
+            cute_fp8_gemm(ws, M, H, I_DIM, sgb,
+                          g2wp+(int64_t)e*H*I_DIM, g2sp+(int64_t)e*NHB*NIB, NIB, g2b);
+
             {dim3 grid((H+255)/256,M);accum_k<<<grid,256,0,ws>>>(g2b,eti,etw,ofp,M);}
         }
     }
