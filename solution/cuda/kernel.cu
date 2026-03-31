@@ -129,6 +129,22 @@ static void init_streams() {
     s_init = true;
 }
 
+// CuTe GEMM helper — launches cute_gemm_tf32 kernel
+// D[M,N] = A[M,K] * B[N,K]^T, all K-contiguous
+static int s_cute_smem = 0;
+static void cute_sgemm(cudaStream_t stream, int M, int N, int K,
+                        const float* A, const float* B, float* D) {
+#if defined(CUTLASS_ARCH_MMA_SM100A_ENABLED)
+    if (s_cute_smem == 0) {
+        s_cute_smem = cute_gemm_smem_size();
+        cudaFuncSetAttribute(cute_gemm_tf32<16>, cudaFuncAttributeMaxDynamicSharedMemorySize, s_cute_smem);
+    }
+    dim3 grid((M + 127) / 128, (N + 127) / 128);
+    cute_gemm_tf32<16><<<grid, 128, s_cute_smem, stream>>>(A, K, B, K, D, N, M, N, K);
+#endif
+}
+
+// CUTLASS GEMM (existing, fallback)
 static void cutlass_sgemm(int sid, cudaStream_t stream, int M, int N, int K,
                           const float* A, const float* B, float* D) {
     using SA = typename GemmKernel::StrideA;
@@ -251,9 +267,9 @@ void KernelFunc(
             int*eti=toi+st+c0; float*etw=tow+st+c0;
 
             {int nn=M*H;fused_dequant_gather<<<(nn+255)/256,256,0,ws>>>(hsp,hssp,eti,ag,M,as0,as1);}
-            cutlass_sgemm(sid, ws, M, G1, H, ag, w1f, g1b);
+            cute_sgemm(ws, M, G1, H, ag, w1f, g1b);
             {int nn=M*I_DIM;swiglu_k<<<(nn+255)/256,256,0,ws>>>(g1b,sgb,M);}
-            cutlass_sgemm(sid, ws, M, H, I_DIM, sgb, w2f, g2b);
+            cute_sgemm(ws, M, H, I_DIM, sgb, w2f, g2b);
             {dim3 grid((H+255)/256,M);accum_k<<<grid,256,0,ws>>>(g2b,eti,etw,ofp,M);}
         }
     }
