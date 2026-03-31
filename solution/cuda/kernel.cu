@@ -28,6 +28,8 @@
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
 #include "cutlass/util/packed_stride.hpp"
 
+#include "cute_gemm.cuh"  // CuTe UMMA GEMM kernel
+
 #include <tvm/ffi/container/tensor.h>
 #include <tvm/ffi/dtype.h>
 #include <tvm/ffi/error.h>
