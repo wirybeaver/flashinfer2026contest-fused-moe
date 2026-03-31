@@ -75,9 +75,12 @@ cute_gemm_tf32(
     __syncthreads();
 
     tiled_mma.accumulate_ = UMMA::ScaleOut::Zero;
-    for (int kt = 0; kt < size<3>(tCgA); ++kt) {
+    int num_k_tiles = K / BK;
+    for (int kt = 0; kt < num_k_tiles; ++kt) {
+        // Copy GMEM → SMEM using cooperative_copy (tutorial pattern)
         cooperative_copy<128>(threadIdx.x, tCgA(_,_,_,kt), sA);
         cooperative_copy<128>(threadIdx.x, tCgB(_,_,_,kt), sB);
+        __syncthreads();
         __syncthreads();
 
         if (ew) {
@@ -91,6 +94,7 @@ cute_gemm_tf32(
         ph ^= 1;
     }
 
+    // Epilogue: TMEM → RMEM → GMEM
     TiledCopy t2r = make_tmem_copy(SM100_TMEM_LOAD_32dp32b1x{}, tCtAcc);
     ThrCopy tc = t2r.get_slice(threadIdx.x);
     Tensor tDt = tc.partition_S(tCtAcc);
