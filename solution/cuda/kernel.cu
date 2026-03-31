@@ -267,9 +267,18 @@ void KernelFunc(
             int*eti=toi+st+c0; float*etw=tow+st+c0;
 
             {int nn=M*H;fused_dequant_gather<<<(nn+255)/256,256,0,ws>>>(hsp,hssp,eti,ag,M,as0,as1);}
-            cute_sgemm(ws, M, G1, H, ag, w1f, g1b);
+            // Use CuTe GEMM (UMMA tensor cores) — fallback to CUTLASS if M not multiple of 128
+            if (M >= 128 && M % 128 == 0) {
+                cute_sgemm(ws, M, G1, H, ag, w1f, g1b);
+            } else {
+                cutlass_sgemm(sid, ws, M, G1, H, ag, w1f, g1b);
+            }
             {int nn=M*I_DIM;swiglu_k<<<(nn+255)/256,256,0,ws>>>(g1b,sgb,M);}
-            cute_sgemm(ws, M, H, I_DIM, sgb, w2f, g2b);
+            if (M >= 128 && M % 128 == 0) {
+                cute_sgemm(ws, M, H, I_DIM, sgb, w2f, g2b);
+            } else {
+                cutlass_sgemm(sid, ws, M, H, I_DIM, sgb, w2f, g2b);
+            }
             {dim3 grid((H+255)/256,M);accum_k<<<grid,256,0,ws>>>(g2b,eti,etw,ofp,M);}
         }
     }
