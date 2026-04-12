@@ -20,11 +20,9 @@ TOP_K = 8
 N_GROUP = 8
 TOPK_GROUP = 4
 BLOCK = 128
-GEMM1_INPUT_PRECISION = "tf32"
-GEMM2_INPUT_PRECISION = "tf32"
 GEMM1_BLOCK_M = 128
 GEMM1_BLOCK_N = 128
-GEMM1_BLOCK_K = 64
+GEMM1_BLOCK_K = 128
 GEMM2_BLOCK_M = 128
 GEMM2_BLOCK_N = 128
 GEMM2_BLOCK_K = 64
@@ -200,21 +198,19 @@ def grouped_fused_dequant_gemm1_swiglu_kernel(
     num_n_tiles,
     total_tiles,
     NUM_EXPERTS: tl.constexpr,
-    INPUT_PRECISION: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     SCALE_BLOCK: tl.constexpr,
     NUM_SMS: tl.constexpr,
 ):
-    """Persistent fused: FP8 dequant + GEMM1 (gate & up) + SwiGLU."""
+    """Persistent fused: native FP8 dot + post-scale + GEMM1 (gate & up) + SwiGLU."""
     start_pid = tl.program_id(0)
 
     for tile_id in tl.range(start_pid, total_tiles, NUM_SMS):
         pid_m = tile_id // num_n_tiles
         pid_n = tile_id % num_n_tiles
 
-        # Binary search for expert_id from pid_m
         lo = 0
         hi = NUM_EXPERTS
         for _ in tl.static_range(0, 8):
@@ -241,38 +237,36 @@ def grouped_fused_dequant_gemm1_swiglu_kernel(
 
         w_base = w_ptr + expert_id * expert_stride_w
         wscale_base = w_scale_ptr + expert_id * expert_stride_scale
+        n_block_gate = (pid_n * BLOCK_N) // SCALE_BLOCK
+        n_block_up = ((pid_n * BLOCK_N) + N) // SCALE_BLOCK
 
         for k in range(0, K, BLOCK_K):
             k_ids = k + offs_k
-            # Inline dequant: load FP8 hidden states and scale
-            a_ptrs = hidden_ptr + token_ids[:, None] * stride_hidden_m + k_ids[None, :] * stride_hidden_k
-            a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (k_ids[None, :] < K), other=0.0)
-            a = tl.cast(a, tl.float32)
-            # hidden_states_scale is [num_blocks, seq_len], k_block indexes the block dim
-            h_scale_block = k // SCALE_BLOCK
-            h_scale = tl.load(hidden_scale_ptr + h_scale_block * stride_hscale_b + token_ids * stride_hscale_t,
-                              mask=offs_m < M, other=1.0)
-            a = a * h_scale[:, None]
-
             k_block = k // SCALE_BLOCK
 
-            # Gate weights (rows [offs_n])
-            n_block_gate = (pid_n * BLOCK_N) // SCALE_BLOCK
+            # Load FP8 hidden states directly (no cast)
+            a_ptrs = hidden_ptr + token_ids[:, None] * stride_hidden_m + k_ids[None, :] * stride_hidden_k
+            a = tl.load(a_ptrs, mask=(offs_m[:, None] < M) & (k_ids[None, :] < K), other=0.0)
+
+            # Load FP8 gate weights directly
             w_gate_ptrs = w_base + k_ids[:, None] * stride_wk + offs_n[None, :] * stride_wm
             w_gate = tl.load(w_gate_ptrs, mask=(k_ids[:, None] < K) & (offs_n[None, :] < N), other=0.0)
-            w_gate = tl.cast(w_gate, tl.float32)
-            scale_gate = tl.load(wscale_base + n_block_gate * stride_scale_n + k_block * stride_scale_k)
-            w_gate = w_gate * scale_gate
-            acc_gate += tl.dot(a, w_gate, input_precision=INPUT_PRECISION)
 
-            # Up weights (rows [offs_n + N])
-            n_block_up = ((pid_n * BLOCK_N) + N) // SCALE_BLOCK
+            # Native FP8 dot product + post-multiply scale
+            partial_gate = tl.dot(a, w_gate)
+            h_scale = tl.load(hidden_scale_ptr + k_block * stride_hscale_b + token_ids * stride_hscale_t,
+                              mask=offs_m < M, other=1.0)
+            scale_gate = tl.load(wscale_base + n_block_gate * stride_scale_n + k_block * stride_scale_k)
+            acc_gate += partial_gate * (h_scale[:, None] * scale_gate)
+
+            # Load FP8 up weights directly
             w_up_ptrs = w_base + k_ids[:, None] * stride_wk + (offs_n[None, :] + N) * stride_wm
             w_up = tl.load(w_up_ptrs, mask=(k_ids[:, None] < K) & (offs_n[None, :] < N), other=0.0)
-            w_up = tl.cast(w_up, tl.float32)
+
+            # Native FP8 dot product + post-multiply scale
+            partial_up = tl.dot(a, w_up)
             scale_up = tl.load(wscale_base + n_block_up * stride_scale_n + k_block * stride_scale_k)
-            w_up = w_up * scale_up
-            acc_up += tl.dot(a, w_up, input_precision=INPUT_PRECISION)
+            acc_up += partial_up * (h_scale[:, None] * scale_up)
 
         # SwiGLU: silu(up) * gate
         silu_up = acc_up / (1.0 + tl.exp(-acc_up))
@@ -307,7 +301,6 @@ def grouped_fused_gemm2_acc_kernel(
     num_n_tiles,
     total_tiles,
     NUM_EXPERTS: tl.constexpr,
-    INPUT_PRECISION: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
@@ -320,7 +313,6 @@ def grouped_fused_gemm2_acc_kernel(
         pid_m = tile_id // num_n_tiles
         pid_n = tile_id % num_n_tiles
 
-        # Binary search for expert_id
         lo = 0
         hi = NUM_EXPERTS
         for _ in tl.static_range(0, 8):
@@ -347,26 +339,25 @@ def grouped_fused_gemm2_acc_kernel(
 
         w_base = w_ptr + expert_id * expert_stride_w
         scale_base = w_scale_ptr + expert_id * expert_stride_scale
+        n_block = (pid_n * BLOCK_N) // SCALE_BLOCK
 
         global_m = expert_start + offs_m
         for k in range(0, K, BLOCK_K):
             k_ids = k + offs_k
+            k_block = k // SCALE_BLOCK
+
             c_ptrs = c_ptr + global_m[:, None] * stride_cm + k_ids[None, :] * stride_ck
             c = tl.load(c_ptrs, mask=(offs_m[:, None] < M) & (k_ids[None, :] < K), other=0.0)
-            c = tl.cast(c, tl.float32)
 
             w_ptrs = w_base + k_ids[:, None] * stride_wk + offs_n[None, :] * stride_wm
             w = tl.load(w_ptrs, mask=(k_ids[:, None] < K) & (offs_n[None, :] < N), other=0.0)
             w = tl.cast(w, tl.float32)
 
-            n_block = (pid_n * BLOCK_N) // SCALE_BLOCK
-            k_block = k // SCALE_BLOCK
             scale = tl.load(scale_base + n_block * stride_scale_n + k_block * stride_scale_k)
             w = w * scale
 
-            acc += tl.dot(c, w, input_precision=INPUT_PRECISION)
+            acc += tl.dot(c, w, input_precision="tf32")
 
-        # Multiply by token weight and atomic scatter-add to output
         acc = acc * weights[:, None]
         mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
         out_ptrs = out_ptr + token_ids[:, None] * stride_out_m + offs_n[None, :] * stride_out_n
@@ -496,14 +487,13 @@ def kernel(
                 num_n_tiles_gemm1,
                 total_tiles_gemm1,
                 NUM_EXPERTS=NUM_LOCAL_EXPERTS,
-                INPUT_PRECISION=GEMM1_INPUT_PRECISION,
                 BLOCK_M=GEMM1_BLOCK_M,
                 BLOCK_N=GEMM1_BLOCK_N,
                 BLOCK_K=GEMM1_BLOCK_K,
                 SCALE_BLOCK=BLOCK,
                 NUM_SMS=NUM_SMS,
                 num_warps=8,
-                num_stages=4,
+                num_stages=1,
             )
 
             # Grouped fused GEMM2 + accumulate: persistent kernel
@@ -534,7 +524,6 @@ def kernel(
                 num_n_tiles_gemm2,
                 total_tiles_gemm2,
                 NUM_EXPERTS=NUM_LOCAL_EXPERTS,
-                INPUT_PRECISION=GEMM2_INPUT_PRECISION,
                 BLOCK_M=GEMM2_BLOCK_M,
                 BLOCK_N=GEMM2_BLOCK_N,
                 BLOCK_K=GEMM2_BLOCK_K,
