@@ -424,6 +424,8 @@ def kernel(
     token_weights = torch.empty((max(total, 1),), device=device, dtype=torch.float32)
     expert_positions = torch.zeros((NUM_LOCAL_EXPERTS,), device=device, dtype=torch.int32)
 
+    output_fp32 = torch.zeros((seq_len, HIDDEN_SIZE), device=device, dtype=torch.float32)
+
     if total > 0:
         scatter_kernel[(seq_len,)](
             topk_idx,
@@ -441,11 +443,6 @@ def kernel(
             num_stages=1,
         )
 
-    output_fp32 = torch.zeros((seq_len, HIDDEN_SIZE), device=device, dtype=torch.float32)
-
-    if total > 0:
-        # Grouped kernel path: 2 launches
-        # Compute m_tile_offsets on GPU to avoid CPU-GPU sync
         expert_counts = expert_offsets[1:] - expert_offsets[:-1]
         bm = GEMM1_BLOCK_M
         m_tile_counts = (expert_counts + bm - 1) // bm
@@ -454,10 +451,8 @@ def kernel(
         total_m_tiles = int(m_tile_offsets[-1].item())
 
         if total_m_tiles > 0:
-            # Allocate scratch buffer for SwiGLU output only
             c_buf = torch.empty((total, INTERMEDIATE_SIZE), device=device, dtype=torch.float32)
 
-            # Fused dequant + GEMM1 + SwiGLU: persistent kernel
             num_n_tiles_gemm1 = triton.cdiv(INTERMEDIATE_SIZE, GEMM1_BLOCK_N)
             total_tiles_gemm1 = total_m_tiles * num_n_tiles_gemm1
             grid_gemm1 = (min(NUM_SMS, total_tiles_gemm1),)
@@ -496,7 +491,6 @@ def kernel(
                 num_stages=1,
             )
 
-            # Grouped fused GEMM2 + accumulate: persistent kernel
             num_n_tiles_gemm2 = triton.cdiv(HIDDEN_SIZE, GEMM2_BLOCK_N)
             total_tiles_gemm2 = total_m_tiles * num_n_tiles_gemm2
             grid_gemm2 = (min(NUM_SMS, total_tiles_gemm2),)
