@@ -38,7 +38,7 @@ image = (
         # Make nvcc 12.8 default
         "ln -sf /usr/local/cuda-12.8/bin/nvcc /usr/local/bin/nvcc || true",
     )
-    .pip_install("flashinfer-bench", "triton", "numpy")
+    .pip_install("flashinfer-bench", "triton==3.6.0", "numpy")
 )
 
 
