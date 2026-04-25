@@ -25,8 +25,7 @@ GEMM1_BLOCK_N = 128
 GEMM1_BLOCK_K = 128
 GEMM2_BLOCK_M = 128
 GEMM2_BLOCK_N = 128
-GEMM2_BLOCK_K = 128
-FP8_E4M3_MAX = 448.0
+GEMM2_BLOCK_K = 64
 
 
 @triton.jit
@@ -180,7 +179,6 @@ def grouped_fused_dequant_gemm1_swiglu_kernel(
     w_scale_ptr,
     token_idx_ptr,
     c_ptr,
-    c_scale_ptr,
     expert_offsets_ptr,
     m_tile_offsets_ptr,
     N,  # INTERMEDIATE_SIZE (output is N, not 2*N)
@@ -194,8 +192,6 @@ def grouped_fused_dequant_gemm1_swiglu_kernel(
     stride_wk,
     stride_cm,
     stride_cn,
-    stride_cs_k,  # c_scale stride for K-block dim
-    stride_cs_t,  # c_scale stride for token dim
     expert_stride_scale,
     stride_scale_n,
     stride_scale_k,
@@ -208,7 +204,7 @@ def grouped_fused_dequant_gemm1_swiglu_kernel(
     SCALE_BLOCK: tl.constexpr,
     NUM_SMS: tl.constexpr,
 ):
-    """Persistent fused: native FP8 dot + post-scale + GEMM1 (gate & up) + SwiGLU + per-row FP8 quant."""
+    """Persistent fused: native FP8 dot + post-scale + GEMM1 (gate & up) + SwiGLU."""
     start_pid = tl.program_id(0)
 
     for tile_id in tl.range(start_pid, total_tiles, NUM_SMS):
@@ -274,29 +270,15 @@ def grouped_fused_dequant_gemm1_swiglu_kernel(
 
         # SwiGLU: silu(up) * gate
         silu_up = acc_up / (1.0 + tl.exp(-acc_up))
-        result = silu_up * acc_gate  # [BLOCK_M, BLOCK_N]
-
-        # Per-row, per-block (BLOCK_N == SCALE_BLOCK == 128) FP8 quantize.
-        absmax = tl.max(tl.abs(result), axis=1)  # [BLOCK_M]
-        scale = absmax / FP8_E4M3_MAX
-        scale = tl.where(scale > 0, scale, 1.0)
-        inv_scale = 1.0 / scale
-        quant = result * inv_scale[:, None]
-        c_fp8 = quant.to(c_ptr.dtype.element_ty)
+        result = silu_up * acc_gate
 
         c_ptrs = c_ptr + (expert_start + offs_m[:, None]) * stride_cm + offs_n[None, :] * stride_cn
-        tl.store(c_ptrs, c_fp8, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
-
-        # Store per-row scale, indexed [n_block, token_global]
-        n_block_out = (pid_n * BLOCK_N) // SCALE_BLOCK
-        s_ptrs = c_scale_ptr + n_block_out * stride_cs_k + (expert_start + offs_m) * stride_cs_t
-        tl.store(s_ptrs, scale, mask=offs_m < M)
+        tl.store(c_ptrs, result, mask=(offs_m[:, None] < M) & (offs_n[None, :] < N))
 
 
 @triton.jit
 def grouped_fused_gemm2_acc_kernel(
     c_ptr,
-    c_scale_ptr,
     w_ptr,
     w_scale_ptr,
     token_idx_ptr,
@@ -308,8 +290,6 @@ def grouped_fused_gemm2_acc_kernel(
     K,  # INTERMEDIATE_SIZE
     stride_cm,
     stride_ck,
-    stride_cs_k,  # c_scale stride for K-block dim
-    stride_cs_t,  # c_scale stride for token dim
     expert_stride_w,
     stride_wm,
     stride_wk,
@@ -327,7 +307,6 @@ def grouped_fused_gemm2_acc_kernel(
     SCALE_BLOCK: tl.constexpr,
     NUM_SMS: tl.constexpr,
 ):
-    """Persistent fused: native FP8 dot + per-block post-scale + per-token weighted atomic_add."""
     start_pid = tl.program_id(0)
 
     for tile_id in tl.range(start_pid, total_tiles, NUM_SMS):
@@ -367,20 +346,17 @@ def grouped_fused_gemm2_acc_kernel(
             k_ids = k + offs_k
             k_block = k // SCALE_BLOCK
 
-            # Load FP8 c (no cast).
             c_ptrs = c_ptr + global_m[:, None] * stride_cm + k_ids[None, :] * stride_ck
             c = tl.load(c_ptrs, mask=(offs_m[:, None] < M) & (k_ids[None, :] < K), other=0.0)
 
-            # Load FP8 weight (no cast).
             w_ptrs = w_base + k_ids[:, None] * stride_wk + offs_n[None, :] * stride_wm
             w = tl.load(w_ptrs, mask=(k_ids[:, None] < K) & (offs_n[None, :] < N), other=0.0)
+            w = tl.cast(w, tl.float32)
 
-            # Native FP8 dot product + post-multiply per-block scales.
-            partial = tl.dot(c, w)
-            c_scale = tl.load(c_scale_ptr + k_block * stride_cs_k + global_m * stride_cs_t,
-                              mask=offs_m < M, other=1.0)
-            w_scale = tl.load(scale_base + n_block * stride_scale_n + k_block * stride_scale_k)
-            acc += partial * (c_scale[:, None] * w_scale)
+            scale = tl.load(scale_base + n_block * stride_scale_n + k_block * stride_scale_k)
+            w = w * scale
+
+            acc += tl.dot(c, w, input_precision="tf32")
 
         acc = acc * weights[:, None]
         mask = (offs_m[:, None] < M) & (offs_n[None, :] < N)
@@ -475,9 +451,7 @@ def kernel(
         total_m_tiles = int(m_tile_offsets[-1].item())
 
         if total_m_tiles > 0:
-            c_buf = torch.empty((total, INTERMEDIATE_SIZE), device=device, dtype=hidden_states.dtype)
-            num_k_blocks_g2 = INTERMEDIATE_SIZE // BLOCK
-            c_scale = torch.empty((num_k_blocks_g2, total), device=device, dtype=torch.float32)
+            c_buf = torch.empty((total, INTERMEDIATE_SIZE), device=device, dtype=torch.float32)
 
             num_n_tiles_gemm1 = triton.cdiv(INTERMEDIATE_SIZE, GEMM1_BLOCK_N)
             total_tiles_gemm1 = total_m_tiles * num_n_tiles_gemm1
@@ -489,7 +463,6 @@ def kernel(
                 gemm1_weights_scale,
                 token_indices,
                 c_buf,
-                c_scale,
                 expert_offsets,
                 m_tile_offsets,
                 INTERMEDIATE_SIZE,
@@ -503,8 +476,6 @@ def kernel(
                 gemm1_weights.stride(2),
                 c_buf.stride(0),
                 c_buf.stride(1),
-                c_scale.stride(0),
-                c_scale.stride(1),
                 gemm1_weights_scale.stride(0),
                 gemm1_weights_scale.stride(1),
                 gemm1_weights_scale.stride(2),
@@ -525,7 +496,6 @@ def kernel(
             grid_gemm2 = (min(NUM_SMS, total_tiles_gemm2),)
             grouped_fused_gemm2_acc_kernel[grid_gemm2](
                 c_buf,
-                c_scale,
                 gemm2_weights,
                 gemm2_weights_scale,
                 token_indices,
@@ -537,8 +507,6 @@ def kernel(
                 INTERMEDIATE_SIZE,
                 c_buf.stride(0),
                 c_buf.stride(1),
-                c_scale.stride(0),
-                c_scale.stride(1),
                 gemm2_weights.stride(0),
                 gemm2_weights.stride(1),
                 gemm2_weights.stride(2),
