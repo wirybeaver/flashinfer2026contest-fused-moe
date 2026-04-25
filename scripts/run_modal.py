@@ -23,15 +23,26 @@ from flashinfer_bench import Benchmark, BenchmarkConfig, Solution, TraceSet
 app = modal.App("flashinfer-bench")
 
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
-TRACE_SET_PATH = "/data"
+VOLUME_MOUNT_PATH = "/data"
+TRACE_SET_PATH = "/data/mlsys26-contest"
 
 image = (
-    modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    modal.Image.from_registry("pytorch/pytorch:2.5.1-cuda12.4-cudnn9-devel", add_python=None)
+    .apt_install("git", "build-essential", "cmake", "wget")
+    .run_commands(
+        # Install CUDA 12.8 toolkit for sm_100 support
+        "wget -q https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb",
+        "dpkg -i cuda-keyring_1.1-1_all.deb",
+        "apt-get update",
+        "apt-get install -y cuda-toolkit-12-8 || apt-get install -y cuda-nvcc-12-8",
+        # Make nvcc 12.8 default
+        "ln -sf /usr/local/cuda-12.8/bin/nvcc /usr/local/bin/nvcc || true",
+    )
+    .pip_install("flashinfer-bench", "triton==3.6.0", "numpy")
 )
 
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
+@app.function(image=image, gpu="B200:1", timeout=3600, volumes={VOLUME_MOUNT_PATH: trace_volume})
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
@@ -75,6 +86,8 @@ def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
             if trace.evaluation.correctness:
                 entry["max_abs_error"] = trace.evaluation.correctness.max_absolute_error
                 entry["max_rel_error"] = trace.evaluation.correctness.max_relative_error
+            if trace.evaluation.log:
+                entry["log"] = trace.evaluation.log
             results[definition.name][trace.workload.uuid] = entry
 
     return results
@@ -100,6 +113,12 @@ def print_results(results: dict):
                 print(f" | abs_err={abs_err:.2e}, rel_err={rel_err:.2e}", end="")
 
             print()
+            log_text = result.get("log")
+            if log_text:
+                log_text = log_text.strip()
+                if len(log_text) > 4000:
+                    log_text = log_text[:4000] + "\n...[log truncated]"
+                print(log_text)
 
 
 @app.local_entrypoint()
